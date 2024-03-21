@@ -30,12 +30,20 @@ typedef union {
 typedef struct {
   Clock clock;
   i32 origin;
+  i32 destination;
 } Task;
 
 typedef struct {
   Task tasks[MAX_QUEUE_SIZE];
   u32 head, tail, len;
 } TaskQueue;
+
+typedef struct {
+  TaskQueue queue;
+  pthread_mutex_t lock;
+  pthread_cond_t cond_has_items;
+  pthread_cond_t cond_has_space;
+} MultiThreadedTaskQueue;
 
 bool task_enqueue(TaskQueue *q, Task t){
   if (q->len >= MAX_QUEUE_SIZE) {
@@ -62,38 +70,35 @@ bool task_dequeue(TaskQueue *q, Task *t){
 }
 
 
-void task_dequeue_multithreaded(TaskQueue *q, Task *t, pthread_mutex_t *lock, pthread_cond_t *cond_has_items, pthread_cond_t *cond_has_space){
-  pthread_mutex_lock(lock);
+void task_dequeue_multithreaded(MultiThreadedTaskQueue *q, Task *t){
+  pthread_mutex_lock(&q->lock);
   {
-    while (!task_dequeue(q, t)) {
-        pthread_cond_wait(cond_has_items, lock);
+    while (!task_dequeue(&q->queue, t)) {
+        pthread_cond_wait(&q->cond_has_items, &q->lock);
     }
-    pthread_cond_signal(cond_has_space);
+    pthread_cond_signal(&q->cond_has_space);
   }
-  pthread_mutex_unlock(lock);
+  pthread_mutex_unlock(&q->lock);
 }
 
-void task_enqueue_multithreaded(TaskQueue *q, Task t, pthread_mutex_t *lock, pthread_cond_t *cond_has_items, pthread_cond_t *cond_has_space){
-  pthread_mutex_lock(lock);
+void task_enqueue_multithreaded(MultiThreadedTaskQueue *q, Task t){
+  pthread_mutex_lock(&q->lock);
   {
-    while (!task_enqueue(q, t)) {
-        pthread_cond_wait(cond_has_space, lock);
+    while (!task_enqueue(&q->queue, t)) {
+        pthread_cond_wait(&q->cond_has_space, &q->lock);
     }
-    pthread_cond_signal(cond_has_items);
+    pthread_cond_signal(&q->cond_has_items);
   }
-  pthread_mutex_unlock(lock);
+  pthread_mutex_unlock(&q->lock);
 }
 
 void clock_print(Clock *c){
-  printf("Clock (%d, %d, %d)", c->p1, c->p2, c->p3);
+  printf("Clock (%d, %d, %d)", c->ps[0], c->ps[1], c->ps[2]);
 }
 
 // }}} lib
 
-pthread_mutex_t queue_in_lock, queue_out_lock;
-pthread_cond_t queue_in_has_space, queue_in_has_items, queue_out_has_space, queue_out_has_items;
-
-static TaskQueue queue_in, queue_out;
+static MultiThreadedTaskQueue queue_in, queue_out;
 static i32 process_rank;
 static Clock process_clock;
 
@@ -107,14 +112,8 @@ void event_internal_process(void){
 void event_consume(){
 
   Task out_t;
-  task_dequeue_multithreaded(
-    &queue_out,
-    &out_t,
-    &queue_out_lock,
-    &queue_out_has_items,
-    &queue_out_has_space
-  );
-
+  task_dequeue_multithreaded(&queue_out, &out_t);
+  MPI_Send(&out_t, sizeof(Task), MPI_BYTE, out_t.destination, 0, MPI_COMM_WORLD);
 
   for (i32 i = 0; i < NUM_PROCESSES; ++i) {
     if (out_t.clock.ps[i] > process_clock.ps[i]) {
@@ -122,66 +121,44 @@ void event_consume(){
     }
   }
 
-  process_clock.ps[process_rank]++;
-
-  printf("[THREAD %d: CONSUMER] Processed clock from %d: ", process_rank, out_t.origin);
-  clock_print(&process_clock);
-  printf("\n");
+  // printf("[THREAD %d: CONSUMER] Processed clock from %d: ", process_rank, out_t.origin);
+  // clock_print(&process_clock);
+  // printf("\n");
 }
 
 void event_produce(){
 
-  Task in_t = {
-    .clock = process_clock,
-    .origin = process_rank,
-  };
+  Task receive;
+  MPI_Recv(&receive, sizeof(Task), MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+  task_enqueue_multithreaded(&queue_in, receive);
 
-  task_enqueue_multithreaded(
-    &queue_in,
-    in_t,
-    &queue_in_lock,
-    &queue_in_has_items,
-    &queue_in_has_space
-  );
-
-  process_clock.ps[process_rank]++;
-
-  printf("[THREAD %d: PRODUCER] Produced clock: ", process_rank);
-  clock_print(&process_clock);
-  printf("\n");
+  // printf("[THREAD %d: PRODUCER] Produced clock: ", process_rank);
+  // clock_print(&process_clock);
+  // printf("\n");
 }
 
 void event_send(i32 id){
-
-  Task t;
-  task_dequeue_multithreaded(
-    &queue_in,
-    &t,
-    &queue_in_lock,
-    &queue_in_has_items,
-    &queue_in_has_space
-  );
-
   process_clock.ps[process_rank]++;
+  // TODO: create and enqueue to out
 
-  MPI_Send(&t, sizeof(Task), MPI_BYTE, id, 0, MPI_COMM_WORLD);
+  Task t = {
+    .destination = id,
+    .origin = process_rank,
+    .clock = process_clock
+  };
+
+  task_enqueue_multithreaded(&queue_out, t);
 
   printf("[THREAD %d] Sent clock to %d: ", process_rank, id);
   clock_print(&t.clock);
   printf("\n");
 }
 
-void event_receive(i32 id){
-  Task receive;
-  MPI_Recv(&receive, sizeof(Task), MPI_BYTE, id, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+void event_receive(){
+  process_clock.ps[process_rank]++;
 
-  task_enqueue_multithreaded(
-    &queue_out,
-    receive,
-    &queue_out_lock,
-    &queue_out_has_items,
-    &queue_out_has_space
-  );
+  Task receive;
+  task_dequeue_multithreaded(&queue_in, &receive);
 
   for (i32 i = 0; i < NUM_PROCESSES; ++i) {
     if (receive.clock.ps[i] > process_clock.ps[i]) {
@@ -189,75 +166,60 @@ void event_receive(i32 id){
     }
   }
 
-  process_clock.ps[process_rank]++;
 
-  printf("[THREAD %d] Received clock from %d: ", process_rank, id);
+  printf("[THREAD %d] Received clock from %d: ", process_rank, receive.origin);
   clock_print(&receive.clock);
   printf("\n");
 }
 
 void process0(void){ 
-  event_internal_process();
-
-  printf("[THREAD %d] ", process_rank);
+  printf("[THREAD %d] spawning process ", process_rank);
   clock_print(&process_clock);
   printf("\n");
 
-  event_send(2);
-  event_send(1);
-  event_send(1);
-  event_receive(1);
   event_internal_process();
-  event_internal_process();
+  event_send(1);
+  event_receive();
   event_send(2);
-  event_receive(2);
+  event_receive();
   event_send(1);
   event_internal_process();
 
-  printf("[THREAD %d] Switching clock with thread 1: ", process_rank);
+  printf("[THREAD %d] final clock: ", process_rank);
   clock_print(&process_clock);
   printf("\n");
 }
 void process1(void){
-  printf("[THREAD %d] ", process_rank);
+  printf("[THREAD %d] spawning process ", process_rank);
   clock_print(&process_clock);
   printf("\n");
 
   event_send(0);
-  event_send(2);
-  event_send(0);
-  event_receive(2);
-  event_internal_process();
-  event_internal_process();
-  event_send(2);
-  event_receive(2);
-  event_send(2);
-  event_internal_process();
+  event_receive();
+  event_receive();
+
+  printf("[THREAD %d] final clock: ", process_rank);
+  clock_print(&process_clock);
+  printf("\n");
 }
 void process2(void){
-  event_internal_process();
-  printf("[THREAD %d] ", process_rank);
+  printf("[THREAD %d] spawning process ", process_rank);
   clock_print(&process_clock);
   printf("\n");
 
-  event_receive(0);
-  event_send(1);
-  event_receive(0);
-  event_receive(1);
-  event_receive(1);
   event_internal_process();
-  event_internal_process();
-  event_send(1);
-  event_receive(1);
   event_send(0);
-  event_internal_process();
+  event_receive();
+
+  printf("[THREAD %d] final clock: ", process_rank);
+  clock_print(&process_clock);
+  printf("\n");
 }
 
 
 void *consumer_thread(void *data){
   for (;;) {
     event_consume();
-    sleep(1);
   }
   pthread_exit(NULL);
 }
@@ -265,7 +227,6 @@ void *consumer_thread(void *data){
 void *producer_thread(void *data){
   for (;;) {
     event_produce();
-    sleep(1);
   }
   pthread_exit(NULL);
 }
@@ -275,13 +236,13 @@ int main(void){
   MPI_Comm_rank(MPI_COMM_WORLD, &process_rank);
   assert(process_rank < NUM_PROCESSES);
 
-  pthread_mutex_init(&queue_in_lock, NULL);
-  pthread_cond_init(&queue_in_has_space, NULL);
-  pthread_cond_init(&queue_in_has_items, NULL);
+  pthread_mutex_init(&queue_in.lock, NULL);
+  pthread_cond_init(&queue_in.cond_has_items, NULL);
+  pthread_cond_init(&queue_in.cond_has_space, NULL);
 
-  pthread_mutex_init(&queue_out_lock, NULL);
-  pthread_cond_init(&queue_out_has_space, NULL);
-  pthread_cond_init(&queue_out_has_items, NULL);
+  pthread_mutex_init(&queue_out.lock, NULL);
+  pthread_cond_init(&queue_out.cond_has_space, NULL);
+  pthread_cond_init(&queue_out.cond_has_items, NULL);
 
 
   pthread_t producer_thread_id;
@@ -291,9 +252,9 @@ int main(void){
   pthread_create(&consumer_thread_id, NULL, consumer_thread, NULL);
 
   switch (process_rank){
-  case 0: process0();
-  case 1: process1();
-  case 2: process2();
+  case 0: process0(); break;
+  case 1: process1(); break;
+  case 2: process2(); break;
   }
 
   MPI_Finalize();
